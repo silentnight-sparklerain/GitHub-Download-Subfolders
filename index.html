@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GitHub 文件夹下载器 (CF加速版)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
+        input { width: 100%; padding: 10px; margin-bottom: 10px; box-sizing: border-box; }
+        button { width: 100%; padding: 10px; background-color: #2ea44f; color: white; border: none; cursor: pointer; font-size: 16px; border-radius: 6px;}
+        button:hover { background-color: #2c974b; }
+        button:disabled { background-color: #94d3a2; cursor: not-allowed; }
+        #status { margin-top: 20px; color: #555; white-space: pre-wrap; font-size: 14px; word-break: break-all;}
+        .error { color: red; }
+    </style>
+</head>
+<body>
+
+    <h2>GitHub 文件夹下载器 (CF加速版)</h2>
+    <p>输入 GitHub 文件夹链接:</p>
+    
+    <input type="text" id="urlInput" placeholder="https://github.com/user/repo/tree/main/中文文件夹">
+    <input type="password" id="tokenInput" placeholder="GitHub Token (可选)">
+    <button id="downloadBtn" onclick="startDownload()">下载 ZIP</button>
+    <div id="status"></div>
+
+<script>
+    // ==========================================
+    // 配置你的 Cloudflare Worker 域名
+    const PROXY_DOMAIN = "https://down-github-subfolders.sparklerain.top"; 
+    // ==========================================
+
+    async function startDownload() {
+        const url = document.getElementById('urlInput').value.trim();
+        const token = document.getElementById('tokenInput').value.trim();
+        const statusDiv = document.getElementById('status');
+        const btn = document.getElementById('downloadBtn');
+
+        if (!url) {
+            statusDiv.innerHTML = '<span class="error">请输入链接</span>';
+            return;
+        }
+
+        btn.disabled = true;
+        statusDiv.innerText = '正在解析链接...';
+
+        try {
+            const parseResult = parseGitHubUrl(url);
+            if (!parseResult) throw new Error("无法解析该 GitHub 链接。");
+            
+            const { owner, repo, branch, dirPath } = parseResult;
+            statusDiv.innerText = `目标: ${owner}/${repo} (分支: ${branch})\n路径: ${dirPath}\n正在获取文件列表...`;
+
+            // 1. 获取文件列表 (直连 GitHub API)
+            const treeData = await fetchGitTree(owner, repo, branch, token);
+            
+            const targetFiles = treeData.tree.filter(item => {
+                return item.path.startsWith(dirPath) && item.type === 'blob';
+            });
+
+            if (targetFiles.length === 0) {
+                throw new Error(`未找到路径 "${dirPath}" 下的文件，请检查路径是否正确。`);
+            }
+
+            statusDiv.innerText = `找到 ${targetFiles.length} 个文件，准备下载...`;
+
+            const zip = new JSZip();
+            let downloadedCount = 0;
+
+            const downloadPromises = targetFiles.map(async (file) => {
+                const zipPath = file.path.substring(dirPath.length).replace(/^\//, ''); 
+                
+                // 编码路径，防止中文乱码
+                const encodedFilePath = encodeURI(file.path);
+                
+                // 使用你的 Cloudflare Worker 进行下载
+                const fileUrl = `${PROXY_DOMAIN}/${owner}/${repo}/${branch}/${encodedFilePath}`;
+
+                try {
+                    const response = await fetch(fileUrl);
+                    if(!response.ok) throw new Error(`Status ${response.status}`);
+                    const blob = await response.blob();
+                    
+                    zip.file(zipPath, blob);
+                    
+                    downloadedCount++;
+                    statusDiv.innerText = `进度: ${downloadedCount} / ${targetFiles.length}`;
+                } catch (e) {
+                    console.error(`下载失败: ${file.path}`, e);
+                    zip.file(zipPath + ".error.txt", "Download failed: " + e.message);
+                }
+            });
+
+            await Promise.all(downloadPromises);
+
+            statusDiv.innerText = '正在打包 ZIP...';
+            const content = await zip.generateAsync({ 
+                type: "blob", 
+                mimeType: "application/zip" 
+            });
+            
+            const folderName = dirPath.split('/').pop() || "download";
+            saveAs(content, `${folderName}.zip`);
+            
+            statusDiv.innerText = '下载完成！';
+
+        } catch (error) {
+            statusDiv.innerHTML = `<span class="error">错误: ${error.message}</span>`;
+            console.error(error);
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    function parseGitHubUrl(url) {
+        const regex = /github\.com\/([^\/]+)\/([^\/]+)\/tree\/([^\/]+)\/(.+)/;
+        const match = url.match(regex);
+        if (match) {
+            return {
+                owner: match[1],
+                repo: match[2],
+                branch: match[3],
+                dirPath: decodeURIComponent(match[4]) 
+            };
+        }
+        return null;
+    }
+
+    async function fetchGitTree(owner, repo, branch, token) {
+        const apiUrl = `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`;
+        const headers = {};
+        if (token) headers['Authorization'] = `token ${token}`;
+
+        const res = await fetch(apiUrl, { headers });
+        if (!res.ok) {
+            if (res.status === 403) throw new Error("API 频率限制 (403)。请稍后再试或填写 Token。");
+            if (res.status === 404) throw new Error("仓库/分支不存在 (404)。");
+            throw new Error(`API 请求失败: ${res.status}`);
+        }
+        return await res.json();
+    }
+</script>
+
+</body>
+</html>
